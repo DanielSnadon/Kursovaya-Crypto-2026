@@ -1,4 +1,4 @@
-// something will appear here soon...
+// Currently that file used to test new features...
 
 using System;
 
@@ -14,8 +14,10 @@ byte[] decrypted = rc5.DecryptBlock(expectedCiphertext);
 Console.WriteLine($"Шифрование: {Convert.ToHexString(encrypted)}");
 Console.WriteLine($"Расшифрование: {Convert.ToHexString(decrypted)}");
 
-if (!encrypted.AsSpan().SequenceEqual(expectedCiphertext) ||
-    !decrypted.AsSpan().SequenceEqual(plaintext))
+if (!encrypted.AsSpan().SequenceEqual(expectedCiphertext) || !decrypted.AsSpan().SequenceEqual(plaintext))
 {
     throw new InvalidOperationException("Ой...");
+} else
+{
+    Console.WriteLine("RC5 feelin good!");
 }
