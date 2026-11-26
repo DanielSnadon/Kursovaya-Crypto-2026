@@ -103,15 +103,15 @@ public sealed class Camellia
         return ((ulong)left << 32) | right;
     }
 
-    private static (ulong left, ulong right) BuildKA(ulong klLeft, ulong klRight)
+    private static (ulong left, ulong right) BuildKA(ulong klLeft, ulong klRight, ulong krLeft = 0, ulong krRight = 0)
     {
         const ulong sigma1 = 0xA09E667F3BCC908BUL;
         const ulong sigma2 = 0xB67AE8584CAA73B2UL;
         const ulong sigma3 = 0xC6EF372FE94F82BEUL;
         const ulong sigma4 = 0x54FF53A5F1D36F1CUL;
 
-        ulong d1 = klLeft;
-        ulong d2 = klRight;
+        ulong d1 = klLeft ^ krLeft;
+        ulong d2 = klRight ^ krRight;
 
         d2 ^= F(d1, sigma1);
         d1 ^= F(d2, sigma2);
@@ -125,6 +125,20 @@ public sealed class Camellia
         return (d1, d2);
     }
 
+    private static (ulong left, ulong right) BuildKB(ulong kaLeft, ulong kaRight, ulong krLeft, ulong krRight)
+    {
+        const ulong sigma5 = 0x10E527FADE682D1DUL;
+        const ulong sigma6 = 0xB05688C2B3E6C1FDUL;
+
+        ulong d1 = kaLeft ^ krLeft;
+        ulong d2 = kaRight ^ krRight;
+
+        d2 ^= F(d1, sigma5);
+        d1 ^= F(d2, sigma6);
+
+        return (d1, d2);
+    }
+
     private static (ulong left, ulong right) RotateKey(UInt128 key, int shift)
     {
         UInt128 rotated = UInt128.RotateLeft(key, shift);
@@ -133,8 +147,64 @@ public sealed class Camellia
         return (left, right);
     }
 
-    private static (ulong[] whiteningKeys, ulong[] roundKeys, ulong[] layerKeys)
-        ExpandKey128(ulong klLeft, ulong klRight)
+    private static (ulong[] whiteningKeys, ulong[] roundKeys, ulong[] layerKeys) ExpandKeyLong(ulong klLeft, ulong klRight, ulong krLeft, ulong krRight)
+    {
+        var (kaLeft, kaRight) = BuildKA(klLeft, klRight, krLeft, krRight);
+        var (kbLeft, kbRight) = BuildKB(kaLeft, kaRight, krLeft, krRight);
+
+        UInt128 kl = ((UInt128)klLeft << 64) | klRight;
+        UInt128 kr = ((UInt128)krLeft << 64) | krRight;
+        UInt128 ka = ((UInt128)kaLeft << 64) | kaRight;
+        UInt128 kb = ((UInt128)kbLeft << 64) | kbRight;
+
+        var kl45 = RotateKey(kl, 45);
+        var kl60 = RotateKey(kl, 60);
+        var kl77 = RotateKey(kl, 77);
+        var kl111 = RotateKey(kl, 111);
+
+        var kr15 = RotateKey(kr, 15);
+        var kr30 = RotateKey(kr, 30);
+        var kr60 = RotateKey(kr, 60);
+        var kr94 = RotateKey(kr, 94);
+
+        var ka15 = RotateKey(ka, 15);
+        var ka45 = RotateKey(ka, 45);
+        var ka77 = RotateKey(ka, 77);
+        var ka94 = RotateKey(ka, 94);
+
+        var kb30 = RotateKey(kb, 30);
+        var kb60 = RotateKey(kb, 60);
+        var kb111 = RotateKey(kb, 111);
+
+        ulong[] whiteningKeys = { klLeft, klRight, kb111.left, kb111.right };
+
+        ulong[] roundKeys =
+        {
+            kbLeft, kbRight,
+            kr15.left, kr15.right,
+            ka15.left, ka15.right,
+            kb30.left, kb30.right,
+            kl45.left, kl45.right,
+            ka45.left, ka45.right,
+            kr60.left, kr60.right,
+            kb60.left, kb60.right,
+            kl77.left, kl77.right,
+            kr94.left, kr94.right,
+            ka94.left, ka94.right,
+            kl111.left, kl111.right
+        };
+
+        ulong[] layerKeys =
+        {
+            kr30.left, kr30.right,
+            kl60.left, kl60.right,
+            ka77.left, ka77.right
+        };
+
+        return (whiteningKeys, roundKeys, layerKeys);
+    }
+
+    private static (ulong[] whiteningKeys, ulong[] roundKeys, ulong[] layerKeys) ExpandKey128(ulong klLeft, ulong klRight)
     {
         var (kaLeft, kaRight) = BuildKA(klLeft, klRight);
 
@@ -171,5 +241,108 @@ public sealed class Camellia
         };
 
         return (whiteningKeys, roundKeys, layerKeys);
+    }
+
+    private (ulong[] whiteningKeys, ulong[] roundKeys, ulong[] layerKeys)? expandedKeys;
+
+    public void SetKey(byte[] key)
+    {
+        var (klLeft, klRight, krLeft, krRight) = ReadKeyParts(key);
+
+        expandedKeys = key.Length == 16
+            ? ExpandKey128(klLeft, klRight)
+            : ExpandKeyLong(klLeft, klRight, krLeft, krRight);
+    }
+
+    public byte[] EncryptBlock(byte[] block)
+    {
+        var (whiteningKeys, roundKeys, layerKeys) = expandedKeys ?? throw new InvalidOperationException("Ошибка EncryptBlock: вызови setKey.");
+
+        var (left, right) = ReadBlockWords(block);
+
+        left ^= whiteningKeys[0];
+        right ^= whiteningKeys[1];
+
+        int layerKeyIndex = 0;
+
+        for (int round = 1; round <= roundKeys.Length; round++)
+        {
+            ulong nextLeft = right ^ F(left, roundKeys[round - 1]);
+            right = left;
+            left = nextLeft;
+
+            if (round % 6 == 0 && round < roundKeys.Length)
+            {
+                left = FL(left, layerKeys[layerKeyIndex]);
+                right = FLInverse(right, layerKeys[layerKeyIndex + 1]);
+                layerKeyIndex += 2;
+            }
+        }
+
+        byte[] result = new byte[16];
+        BinaryPrimitives.WriteUInt64BigEndian(result.AsSpan(0, 8), right ^ whiteningKeys[2]);
+        BinaryPrimitives.WriteUInt64BigEndian(result.AsSpan(8, 8), left ^ whiteningKeys[3]);
+
+        return result;
+    }
+
+    public byte[] DecryptBlock(byte[] block)
+    {
+        var (whiteningKeys, roundKeys, layerKeys) = expandedKeys ?? throw new InvalidOperationException("Ошибка EncryptBlock: вызови setKey.");
+
+        var (first, second) = ReadBlockWords(block);
+
+        ulong left = second ^ whiteningKeys[3];
+        ulong right = first ^ whiteningKeys[2];
+
+        int layerKeyIndex = layerKeys.Length - 2;
+
+        for (int round = roundKeys.Length; round >= 1; round--)
+        {
+            if (round % 6 == 0 && round < roundKeys.Length)
+            {
+                left = FLInverse(left, layerKeys[layerKeyIndex]);
+                right = FL(right, layerKeys[layerKeyIndex + 1]);
+                layerKeyIndex -= 2;
+            }
+
+            ulong previousRight = left ^ F(right, roundKeys[round - 1]);
+            left = right;
+            right = previousRight;
+        }
+
+        left ^= whiteningKeys[0];
+        right ^= whiteningKeys[1];
+
+        byte[] result = new byte[16];
+        BinaryPrimitives.WriteUInt64BigEndian(result.AsSpan(0, 8), left);
+        BinaryPrimitives.WriteUInt64BigEndian(result.AsSpan(8, 8), right);
+        return result;
+    }
+
+    private static (ulong klLeft, ulong klRight, ulong krLeft, ulong krRight) ReadKeyParts(byte[] key)
+    {
+        if (key is null)
+        {
+            throw new ArgumentNullException(nameof(key));
+        }
+
+        if (key.Length != 16 && key.Length != 24 && key.Length != 32)
+        {
+            throw new ArgumentException("Ошибка ReadKeyParts Camellia: ключ должен иметь длину 16, 24 или 32 байта.");
+        }
+
+        ulong klLeft = BinaryPrimitives.ReadUInt64BigEndian(key.AsSpan(0, 8));
+        ulong klRight = BinaryPrimitives.ReadUInt64BigEndian(key.AsSpan(8, 8));
+
+        if (key.Length == 16)
+        {
+            return (klLeft, klRight, 0UL, 0UL);
+        }
+
+        ulong krLeft = BinaryPrimitives.ReadUInt64BigEndian(key.AsSpan(16, 8));
+        ulong krRight = key.Length == 24 ? ~krLeft : BinaryPrimitives.ReadUInt64BigEndian(key.AsSpan(24, 8));
+
+        return (klLeft, klRight, krLeft, krRight);
     }
 }
